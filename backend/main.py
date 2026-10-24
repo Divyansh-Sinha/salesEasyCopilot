@@ -1,4 +1,5 @@
 import logging
+import os
 import uuid
 from copy import deepcopy
 
@@ -24,9 +25,21 @@ app = FastAPI(title="SalesEasy", version="1.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+allowed_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+frontend_env = os.getenv("FRONTEND_URL")
+if frontend_env:
+    for url in frontend_env.split(","):
+        cleaned = url.strip().rstrip("/")
+        if cleaned:
+            allowed_origins.append(cleaned)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app|https://.*\.netlify\.app|https://.*\.onrender\.com",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

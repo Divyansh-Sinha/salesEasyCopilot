@@ -28,7 +28,7 @@ export default function ModelSelector({
     (models.length > 0 ? models[0] : null);
 
   async function handlePing() {
-    if (!selectedModel) return;
+    if (!selectedModel || !apiBase) return;
     setPinging(true);
     setPingResult(null);
     try {
