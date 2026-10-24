@@ -98,12 +98,16 @@ def _has_key(value: str | None) -> bool:
 
 def _anthropic_key() -> str | None:
     key = os.getenv("ANTHROPIC_API_KEY")
-    return key if _has_key(key) else None
+    if not _has_key(key):
+        return None
+    return key.strip().strip("'\"")
 
 
 def _gemini_key() -> str | None:
     key = os.getenv("GEMINI_API_KEY")
-    return key if _has_key(key) else None
+    if not _has_key(key):
+        return None
+    return key.strip().strip("'\"")
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -310,7 +314,18 @@ def analyze_with_llm(
     if model["provider"] == "mock":
         return _analyze_mock(system_prompt, user_message)
     if model["provider"] == "gemini":
-        return _analyze_gemini(system_prompt, user_message, model["id"])
+        result = _analyze_gemini(system_prompt, user_message, model["id"])
+        # If external API failed (e.g. 429 quota exhausted or network error),
+        # fall back to local mock adapter so user update is analyzed and flagged for review
+        if result == FALLBACK_ANALYSIS:
+            logger.info("Falling back to local deterministic adapter due to external Gemini API error/quota")
+            fallback_res = _analyze_mock(system_prompt, user_message)
+            fallback_res["needs_human_review"] = True
+            fallback_res["review_reason"] = (
+                (fallback_res.get("review_reason") or "") + " [Fallback to local analyzer: External API quota limit reached]"
+            ).strip()
+            return fallback_res
+        return result
     return _analyze_anthropic(system_prompt, user_message, model["id"])
 
 
@@ -326,11 +341,11 @@ def _check_gemini_online(model_id: str) -> tuple[bool, str | None]:
         )
         if response.status_code == 200:
             return True, None
-        if response.status_code in {401, 403}:
+        if response.status_code in {400, 401, 403}:
             return False, "Gemini key rejected"
         if response.status_code == 404:
             return False, "Model not available"
-        return False, "Gemini API unreachable"
+        return False, f"Gemini API returned status {response.status_code}"
     except Exception:  # noqa: BLE001
         return False, "Gemini API unreachable"
 
@@ -354,7 +369,7 @@ def _check_anthropic_online(model_id: str) -> tuple[bool, str | None]:
             return False, "Anthropic key rejected"
         if response.status_code == 404:
             return False, "Model not available"
-        return False, "Anthropic API unreachable"
+        return False, f"Anthropic API returned status {response.status_code}"
     except Exception:  # noqa: BLE001
         return False, "Anthropic API unreachable"
 
@@ -402,61 +417,102 @@ def ping_model(model_id: str) -> dict:
     if model["provider"] == "gemini":
         api_key = _gemini_key()
         if not api_key:
-            return {"online": False, "status_reason": "Gemini API key not configured", "model_id": model["id"]}
-        try:
-            from google import genai
-            client = genai.Client(api_key=api_key)
-            res = client.models.generate_content(
-                model=model["id"],
-                contents="test ping",
-            )
-            elapsed_ms = round((time.time() - start) * 1000)
             return {
-                "online": True,
-                "latency_ms": elapsed_ms,
+                "online": False,
+                "latency_ms": 0,
+                "status_reason": "Gemini API key not configured",
                 "model_id": model["id"],
                 "provider": "gemini",
-                "message": f"Responsive in {elapsed_ms}ms",
             }
-        except Exception as exc:
+        try:
+            resp = httpx.get(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model['id']}",
+                headers={"x-goog-api-key": api_key},
+                timeout=8.0,
+            )
             elapsed_ms = round((time.time() - start) * 1000)
-            err_str = str(exc)
-            if "429" in err_str:
-                reason = "Quota limit reached (Free tier)"
-            elif "503" in err_str:
-                reason = "High demand / busy spike (503)"
-            else:
-                reason = type(exc).__name__
+            if resp.status_code == 200:
+                return {
+                    "online": True,
+                    "latency_ms": elapsed_ms,
+                    "model_id": model["id"],
+                    "provider": "gemini",
+                    "message": f"Responsive in {elapsed_ms}ms",
+                }
+            if resp.status_code in {400, 401, 403}:
+                return {
+                    "online": False,
+                    "latency_ms": elapsed_ms,
+                    "model_id": model["id"],
+                    "provider": "gemini",
+                    "status_reason": "Gemini API key rejected or invalid on Render",
+                }
+            if resp.status_code == 404:
+                return {
+                    "online": False,
+                    "latency_ms": elapsed_ms,
+                    "model_id": model["id"],
+                    "provider": "gemini",
+                    "status_reason": f"Model {model['id']} not available in Google API",
+                }
             return {
                 "online": False,
                 "latency_ms": elapsed_ms,
                 "model_id": model["id"],
                 "provider": "gemini",
-                "status_reason": reason,
+                "status_reason": f"Google API status {resp.status_code}",
+            }
+        except Exception as exc:
+            elapsed_ms = round((time.time() - start) * 1000)
+            return {
+                "online": False,
+                "latency_ms": elapsed_ms,
+                "model_id": model["id"],
+                "provider": "gemini",
+                "status_reason": f"Google API unreachable: {type(exc).__name__}",
             }
     else:
         api_key = _anthropic_key()
         if not api_key:
-            return {"online": False, "status_reason": "Anthropic API key not configured", "model_id": model["id"]}
+            return {
+                "online": False,
+                "latency_ms": 0,
+                "status_reason": "Anthropic API key not configured",
+                "model_id": model["id"],
+                "provider": "anthropic",
+            }
         try:
-            client = anthropic.Anthropic(api_key=api_key)
-            client.messages.create(
-                model=model["id"],
-                max_tokens=10,
-                messages=[{"role": "user", "content": "ping"}],
+            resp = httpx.get(
+                f"https://api.anthropic.com/v1/models/{model['id']}",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                timeout=8.0,
             )
             elapsed_ms = round((time.time() - start) * 1000)
+            if resp.status_code == 200:
+                return {
+                    "online": True,
+                    "latency_ms": elapsed_ms,
+                    "model_id": model["id"],
+                    "provider": "anthropic",
+                    "message": f"Responsive in {elapsed_ms}ms",
+                }
             return {
-                "online": True,
+                "online": False,
                 "latency_ms": elapsed_ms,
                 "model_id": model["id"],
                 "provider": "anthropic",
-                "message": f"Responsive in {elapsed_ms}ms",
+                "status_reason": f"Anthropic API status {resp.status_code}",
             }
         except Exception as exc:
+            elapsed_ms = round((time.time() - start) * 1000)
             return {
                 "online": False,
+                "latency_ms": elapsed_ms,
                 "model_id": model["id"],
                 "provider": "anthropic",
-                "status_reason": type(exc).__name__,
+                "status_reason": f"Anthropic unreachable: {type(exc).__name__}",
             }
+
