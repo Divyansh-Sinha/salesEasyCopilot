@@ -23,9 +23,8 @@ logger = logging.getLogger("saleseasy")
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="SalesEasy", version="1.0.0")
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
 allowed_origins = [
+    "https://sales-easy-copilot-kappa.vercel.app",
     "http://localhost:5173",
     "http://localhost:3000",
 ]
@@ -33,13 +32,26 @@ frontend_env = os.getenv("FRONTEND_URL")
 if frontend_env:
     for url in frontend_env.split(","):
         cleaned = url.strip().rstrip("/")
-        if cleaned:
+        if cleaned and cleaned not in allowed_origins:
             allowed_origins.append(cleaned)
+
+async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    origin = request.headers.get("origin")
+    response = JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded (10 requests per minute). Please try again shortly."},
+    )
+    if origin and (origin in allowed_origins or "sales-easy-copilot-kappa" in origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
+
+app.add_exception_handler(RateLimitExceeded, custom_rate_limit_handler)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r"https://.*\.vercel\.app|https://.*\.netlify\.app|https://.*\.onrender\.com",
+    allow_origin_regex=r"https://sales-easy-copilot-kappa(-[a-z0-9-]+)?\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -57,6 +69,11 @@ async def add_request_id(request: Request, call_next):
         logger.exception("Unhandled error")
         response = JSONResponse(content=deepcopy(FALLBACK_ANALYSIS), status_code=200)
     response.headers["X-Request-ID"] = request_id
+    origin = request.headers.get("origin")
+    if origin and "access-control-allow-origin" not in response.headers:
+        if origin in allowed_origins or "sales-easy-copilot-kappa" in origin:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
 
