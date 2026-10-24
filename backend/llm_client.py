@@ -159,42 +159,81 @@ def _analyze_anthropic(system_prompt: str, user_message: str, model_id: str) -> 
     return dict(FALLBACK_ANALYSIS)
 
 
+_LAST_GEMINI_ERROR: str | None = None
+
+
 def _analyze_gemini(system_prompt: str, user_message: str, model_id: str) -> dict:
+    global _LAST_GEMINI_ERROR
     api_key = _gemini_key()
     if not api_key:
+        _LAST_GEMINI_ERROR = "Gemini API key is not configured"
         logger.error("LLM call failed: Gemini API key is not configured")
         return dict(FALLBACK_ANALYSIS)
 
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(api_key=api_key)
     last_error: Exception | None = None
 
-    for attempt in range(2):
-        try:
-            response = client.models.generate_content(
-                model=model_id,
-                contents=user_message,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    max_output_tokens=1024,
-                    temperature=0,
-                ),
-            )
-            raw = (getattr(response, "text", None) or "").strip()
-            parsed = _extract_json(raw)
-            if not isinstance(parsed, dict):
-                raise ValueError("LLM response was not a JSON object")
-            return parsed
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if attempt == 0 and _is_retryable(exc):
-                logger.warning("Transient Gemini error; retrying once")
-                continue
-            break
+    # Strategy 1: google-genai SDK
+    try:
+        from google import genai
+        from google.genai import types
 
-    logger.error("LLM call failed: %s", type(last_error).__name__ if last_error else "unknown")
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_id,
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=1024,
+                temperature=0,
+            ),
+        )
+        raw = (getattr(response, "text", None) or "").strip()
+        parsed = _extract_json(raw)
+        if isinstance(parsed, dict):
+            _LAST_GEMINI_ERROR = None
+            return parsed
+    except Exception as exc:  # noqa: BLE001
+        last_error = exc
+        logger.warning("google-genai SDK call failed: %s; trying direct REST fallback", exc)
+
+    # Strategy 2: Direct REST call via httpx (bypasses SDK environment / dependency quirks)
+    try:
+        payload = {
+            "system_instruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"parts": [{"text": user_message}]}],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": 1024,
+                "responseMimeType": "application/json",
+            },
+        }
+        res = httpx.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent",
+            headers={"x-goog-api-key": api_key},
+            json=payload,
+            timeout=15.0,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    raw_text = parts[0].get("text", "")
+                    parsed = _extract_json(raw_text)
+                    if isinstance(parsed, dict):
+                        _LAST_GEMINI_ERROR = None
+                        return parsed
+        else:
+            msg = f"Google API HTTP {res.status_code}: {res.text[:120]}"
+            logger.error("Gemini REST API error: %s", msg)
+            last_error = RuntimeError(msg)
+    except Exception as exc:  # noqa: BLE001
+        last_error = exc
+        logger.error("Gemini REST call failed: %s", exc)
+
+    _LAST_GEMINI_ERROR = str(last_error) if last_error else "Unknown external error"
+    logger.error("All Gemini strategies failed: %s", _LAST_GEMINI_ERROR)
     return dict(FALLBACK_ANALYSIS)
 
 
@@ -318,11 +357,19 @@ def analyze_with_llm(
         # If external API failed (e.g. 429 quota exhausted or network error),
         # fall back to local mock adapter so user update is analyzed and flagged for review
         if result == FALLBACK_ANALYSIS:
-            logger.info("Falling back to local deterministic adapter due to external Gemini API error/quota")
+            err_msg = _LAST_GEMINI_ERROR or "External API quota/network error"
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg.upper():
+                clean_err = "Google AI Studio Free-Tier daily quota limit reached (429 RESOURCE_EXHAUSTED)"
+            elif "400" in err_msg or "location" in err_msg.lower():
+                clean_err = f"Google API region/argument error: {err_msg[:80]}"
+            else:
+                clean_err = f"External API error: {err_msg[:80]}"
+
+            logger.info("Falling back to local deterministic adapter: %s", clean_err)
             fallback_res = _analyze_mock(system_prompt, user_message)
             fallback_res["needs_human_review"] = True
             fallback_res["review_reason"] = (
-                (fallback_res.get("review_reason") or "") + " [Fallback to local analyzer: External API quota limit reached]"
+                (fallback_res.get("review_reason") or "") + f" [Fallback to local analyzer: {clean_err}]"
             ).strip()
             return fallback_res
         return result

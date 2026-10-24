@@ -125,3 +125,50 @@ async def models_status():
 async def ping_model_endpoint(model_id: str):
     return ping_model(model_id)
 
+
+@app.get("/debug-gemini")
+async def debug_gemini():
+    from llm_client import _gemini_key
+    import httpx
+    api_key = _gemini_key()
+    if not api_key:
+        return {"configured": False, "error": "No GEMINI_API_KEY"}
+    key_preview = api_key[:6] + "..." + api_key[-4:]
+    t1, t2, t3 = {}, {}, {}
+    # 1. Models endpoint
+    try:
+        r1 = httpx.get(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite",
+            headers={"x-goog-api-key": api_key},
+            timeout=8.0,
+        )
+        t1 = {"status": r1.status_code, "ok": r1.status_code == 200}
+    except Exception as e:
+        t1 = {"error": str(e)}
+    # 2. REST generateContent
+    try:
+        payload = {"contents": [{"parts": [{"text": "say hello"}]}]}
+        r2 = httpx.post(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent",
+            headers={"x-goog-api-key": api_key},
+            json=payload,
+            timeout=10.0,
+        )
+        t2 = {"status": r2.status_code, "body": r2.json() if r2.status_code == 200 else r2.text[:200]}
+    except Exception as e:
+        t2 = {"error": str(e)}
+    # 3. SDK generateContent
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        res = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents="say hello",
+        )
+        t3 = {"status": "ok", "text": getattr(res, "text", "")[:60]}
+    except Exception as e:
+        t3 = {"error_type": type(e).__name__, "error": str(e)}
+
+    return {"key_preview": key_preview, "models_endpoint": t1, "rest_generate": t2, "sdk_generate": t3}
+
+
