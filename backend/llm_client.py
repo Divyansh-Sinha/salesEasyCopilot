@@ -14,12 +14,12 @@ logger = logging.getLogger("saleseasy.llm")
 
 SIMULATE_FAILURE_TOKEN = "__SIMULATE_FAILURE__"
 
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 SUPPORTED_MODELS = [
     {
-        "id": "gemini-2.5-flash-lite",
-        "label": "Gemini 2.5 Flash Lite",
+        "id": "gemini-3.5-flash-lite",
+        "label": "Gemini 3.5 Flash Lite (Recommended)",
         "provider": "gemini",
     },
     {
@@ -76,6 +76,8 @@ FALLBACK_ANALYSIS = {
 
 
 def resolve_model(model_id: str | None) -> dict:
+    if model_id == "gemini-2.5-flash-lite":
+        model_id = "gemini-3.5-flash-lite"
     if model_id and model_id in _MODEL_BY_ID:
         return _MODEL_BY_ID[model_id]
     return _MODEL_BY_ID[DEFAULT_MODEL]
